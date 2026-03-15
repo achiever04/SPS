@@ -1,0 +1,40 @@
+# ============================================================
+#  HFT Trading Bot — .gitignore
+# ============================================================
+
+# Environment & Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Models (large binary files)
+models/*.onnx
+models/*.pkl
+models/*.joblib
+
+# Logs
+logs/*.log
+logs/*.log.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
