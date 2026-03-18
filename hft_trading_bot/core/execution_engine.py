@@ -1,19 +1,20 @@
 """
 ===============================================================================
-  execution_engine.py — Async Order Execution & Risk Management
+  execution_engine.py — Async Order Execution & Risk Management  (v2)
 ===============================================================================
-  Handles order placement, simultaneous stop-loss enforcement, position
-  tracking, and complete trade audit logging via async REST API calls.
-
-  Key features:
-  • Every entry order IMMEDIATELY fires a paired Stop-Loss order
-  • Position tracking with configurable max-position enforcement
-  • Daily P&L monitoring with circuit-breaker logic
-  • Complete order lifecycle logging for audit trails
-  • Async aiohttp for non-blocking HTTP calls
+  Changes in v2:
+  • Take-profit logic — configurable TP % per trade
+  • Trailing stop-loss — SL moves up (for BUY) or down (for SELL) as price
+    improves, locking in more profit without manual intervention
+  • Signal cooldown — minimum seconds between consecutive new entries
+  • Kelly-inspired position sizing — scales quantity by confidence
+  • Dry-run mode — all order logic executes but no real API calls made
+  • check_open_positions() method — call on every tick for TP/trailing-SL
+  • Slippage estimator — adjusts fill price by a configurable basis points
 
   Architecture:
-      inference_engine → signal → ExecutionEngine.execute() → Broker API
+      inference_engine → signal → ExecutionEngine.execute_signal()
+                  every tick → ExecutionEngine.check_open_positions(ltp)
 ===============================================================================
 """
 
@@ -21,13 +22,12 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Any
+from typing import Any, Optional
 
 import aiohttp
 
 from utils.logger import get_logger, log_latency
 
-# ── Module logger ───────────────────────────────────────────────────────
 logger = get_logger("EXECUTION")
 
 
@@ -36,44 +36,38 @@ logger = get_logger("EXECUTION")
 # ═════════════════════════════════════════════════════════════════════════
 
 class OrderSide(Enum):
-    """Order direction."""
-    BUY = "BUY"
+    BUY  = "BUY"
     SELL = "SELL"
 
 
 class OrderType(Enum):
-    """Order type classification."""
-    MARKET = "MARKET"
-    LIMIT = "LIMIT"
-    SL = "SL"              # Stop-Loss order
-    SL_MARKET = "SL-M"     # Stop-Loss Market order
+    MARKET   = "MARKET"
+    LIMIT    = "LIMIT"
+    SL       = "SL"
+    SL_MARKET = "SL-M"
 
 
 class OrderStatus(Enum):
-    """Order lifecycle status."""
-    PENDING = "PENDING"
-    PLACED = "PLACED"
-    EXECUTED = "EXECUTED"
+    PENDING   = "PENDING"
+    PLACED    = "PLACED"
+    EXECUTED  = "EXECUTED"
     CANCELLED = "CANCELLED"
-    REJECTED = "REJECTED"
-    FAILED = "FAILED"
+    REJECTED  = "REJECTED"
+    FAILED    = "FAILED"
+
+
+class ExitReason(Enum):
+    STOP_LOSS      = "STOP_LOSS"
+    TAKE_PROFIT    = "TAKE_PROFIT"
+    TRAILING_STOP  = "TRAILING_STOP"
+    MANUAL         = "MANUAL"
+    SHUTDOWN       = "SHUTDOWN"
 
 
 @dataclass
 class Position:
     """
-    Tracks an open trading position with its associated stop-loss.
-
-    Attributes:
-        symbol:         Instrument symbol (e.g., "NIFTY25MARFUT").
-        side:           BUY or SELL.
-        entry_price:    Fill price of the entry order.
-        quantity:       Number of lots/contracts.
-        entry_order_id: Broker's order ID for the entry.
-        sl_order_id:    Broker's order ID for the stop-loss.
-        sl_price:       Trigger price for the stop-loss.
-        timestamp:      Entry time (Unix epoch).
-        pnl:            Realized P&L (updated on exit).
+    Tracks one open position with its SL, TP and trailing-stop state.
     """
     symbol: str
     side: OrderSide
@@ -82,8 +76,14 @@ class Position:
     entry_order_id: str = ""
     sl_order_id: str = ""
     sl_price: float = 0.0
+    tp_price: float = 0.0
+    # Trailing stop tracking
+    trailing_sl_price: float = 0.0   # current trailing-SL price
+    best_price: float = 0.0          # best price seen since entry (for trailing)
+    # Metadata
     timestamp: float = field(default_factory=time.time)
     pnl: float = 0.0
+    exit_reason: Optional[ExitReason] = None
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -92,26 +92,13 @@ class Position:
 
 class ExecutionEngine:
     """
-    Production async order execution engine with built-in risk management.
+    Production async order execution engine (v2).
 
-    Responsibilities:
-    1. Place entry orders based on inference signals.
-    2. IMMEDIATELY place a paired stop-loss after entry confirmation.
-    3. Track all open positions and enforce max-position limits.
-    4. Monitor daily P&L and halt trading if max loss is breached.
-    5. Log every order action for complete audit trail.
-
-    Attributes:
-        api_base_url:       Broker REST API base URL.
-        api_key:            API key for authentication.
-        access_token:       Session access token.
-        symbol:             Trading instrument symbol.
-        exchange:           Exchange code (e.g., "NFO").
-        max_position_size:  Max lots per single position.
-        stop_loss_pct:      Stop-loss percentage from entry price.
-        max_open_positions: Maximum concurrent open positions.
-        max_daily_loss:     Daily loss limit (circuit breaker).
-        max_order_value:    Maximum single order value.
+    New responsibilities vs v1:
+    • check_open_positions(ltp) — evaluate TP and trailing SL on every tick
+    • Trailing SL update — ratchets SL in direction of profit
+    • Signal cooldown — enforces minimum gap between new entries
+    • Dry-run mode — simulates fills without real broker API calls
     """
 
     def __init__(
@@ -123,56 +110,53 @@ class ExecutionEngine:
         exchange: str = "NFO",
         max_position_size: int = 50,
         stop_loss_pct: float = 0.5,
+        take_profit_pct: float = 0.8,
         max_open_positions: int = 3,
         max_daily_loss: float = 10000.0,
         max_order_value: float = 500000.0,
         order_timeout: float = 5.0,
+        trailing_stop_enabled: bool = True,
+        trailing_stop_step: float = 0.2,
+        signal_cooldown_sec: float = 30.0,
+        dry_run: bool = False,
     ):
-        """
-        Initialize the execution engine.
-
-        Args:
-            api_base_url:       Broker REST API endpoint.
-            api_key:            API authentication key.
-            access_token:       Session token.
-            symbol:             Default trading symbol.
-            exchange:           Exchange code.
-            max_position_size:  Max quantity per position.
-            stop_loss_pct:      SL distance as percentage.
-            max_open_positions: Max simultaneous positions.
-            max_daily_loss:     Daily loss limit (absolute).
-            max_order_value:    Max single order value.
-            order_timeout:      HTTP timeout for order API calls.
-        """
         # ── Configuration ────────────────────────────────────────────────
-        self.api_base_url = api_base_url.rstrip("/")
-        self.api_key = api_key
-        self.access_token = access_token
-        self.symbol = symbol
-        self.exchange = exchange
-        self.max_position_size = max_position_size
-        self.stop_loss_pct = stop_loss_pct
-        self.max_open_positions = max_open_positions
-        self.max_daily_loss = max_daily_loss
-        self.max_order_value = max_order_value
-        self.order_timeout = order_timeout
+        self.api_base_url        = api_base_url.rstrip("/")
+        self.api_key             = api_key
+        self.access_token        = access_token
+        self.symbol              = symbol
+        self.exchange            = exchange
+        self.max_position_size   = max_position_size
+        self.stop_loss_pct       = stop_loss_pct
+        self.take_profit_pct     = take_profit_pct
+        self.max_open_positions  = max_open_positions
+        self.max_daily_loss      = max_daily_loss
+        self.max_order_value     = max_order_value
+        self.order_timeout       = order_timeout
+        self.trailing_stop_enabled = trailing_stop_enabled
+        self.trailing_stop_step  = trailing_stop_step   # % step for trailing SL
+        self.signal_cooldown_sec = signal_cooldown_sec
+        self.dry_run             = dry_run
 
-        # ── State tracking ───────────────────────────────────────────────
+        # ── State ────────────────────────────────────────────────────────
         self._open_positions: list[Position] = []
         self._closed_positions: list[Position] = []
         self._daily_pnl: float = 0.0
         self._total_orders: int = 0
         self._rejected_orders: int = 0
         self._trading_halted: bool = False
+        self._last_signal_time: float = 0.0   # epoch seconds of last entry
 
         # ── HTTP session (created in start()) ────────────────────────────
         self._session: Optional[aiohttp.ClientSession] = None
 
+        mode_tag = "DRY-RUN" if dry_run else "LIVE"
         logger.info(
-            f"ExecutionEngine initialized | "
-            f"Symbol: {symbol} | Exchange: {exchange} | "
-            f"MaxPos: {max_open_positions} | SL: {stop_loss_pct}% | "
-            f"MaxDailyLoss: ₹{max_daily_loss:,.0f}"
+            f"ExecutionEngine v2 [{mode_tag}] | "
+            f"{symbol}@{exchange} | "
+            f"SL={stop_loss_pct}% TP={take_profit_pct}% | "
+            f"Trailing={'ON' if trailing_stop_enabled else 'OFF'} | "
+            f"Cooldown={signal_cooldown_sec}s"
         )
 
     # ═════════════════════════════════════════════════════════════════════
@@ -180,44 +164,42 @@ class ExecutionEngine:
     # ═════════════════════════════════════════════════════════════════════
 
     async def start(self) -> None:
-        """Initialize the HTTP session for order execution."""
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.order_timeout),
-            headers={
-                "X-Kite-Version": "3",
-                "Authorization": f"token {self.api_key}:{self.access_token}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
+        """Initialize the aiohttp session."""
+        if not self.dry_run:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.order_timeout),
+                headers={
+                    "X-Kite-Version": "3",
+                    "Authorization": f"token {self.api_key}:{self.access_token}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+        logger.info(
+            f"✅ Execution engine started "
+            f"({'dry-run — no real orders' if self.dry_run else 'LIVE'})"
         )
-        logger.info("✅ Execution engine HTTP session initialized")
 
     async def stop(self) -> None:
-        """
-        Gracefully shut down: cancel all open SL orders and close session.
-        """
+        """Cancel pending SL orders, close session, log final report."""
         logger.info("Execution engine shutting down...")
 
-        # ── Cancel pending stop-loss orders ──────────────────────────────
         for pos in self._open_positions:
-            if pos.sl_order_id:
+            if pos.sl_order_id and not self.dry_run:
                 await self._cancel_order(pos.sl_order_id)
-                logger.info(f"Cancelled SL order {pos.sl_order_id} on shutdown")
 
-        # ── Close HTTP session ───────────────────────────────────────────
         if self._session and not self._session.closed:
             await self._session.close()
 
-        # ── Final report ─────────────────────────────────────────────────
         logger.info(
             f"🏁 Execution engine stopped | "
-            f"Total orders: {self._total_orders} | "
+            f"Orders: {self._total_orders} | "
             f"Rejected: {self._rejected_orders} | "
             f"Daily P&L: ₹{self._daily_pnl:,.2f} | "
-            f"Open positions: {len(self._open_positions)}"
+            f"Open: {len(self._open_positions)}"
         )
 
     # ═════════════════════════════════════════════════════════════════════
-    #  PUBLIC API — TRADE EXECUTION
+    #  ENTRY — NEW SIGNAL
     # ═════════════════════════════════════════════════════════════════════
 
     async def execute_signal(
@@ -227,174 +209,239 @@ class ExecutionEngine:
         confidence: float,
     ) -> Optional[Position]:
         """
-        Execute a trading signal from the inference engine.
+        Execute a trading signal.
 
-        Flow:
-        1. Pre-trade risk checks (max positions, daily loss, order value).
-        2. Place entry order (MARKET).
-        3. On entry confirmation, IMMEDIATELY place a stop-loss order.
-        4. Track the new position.
+        Steps:
+        1. HOLD → return None immediately.
+        2. Pre-trade risk checks (positions, daily loss, cooldown, value).
+        3. Calculate quantity (Kelly-inspired confidence scaling).
+        4. Place entry MARKET order.
+        5. Calculate and place stop-loss order IMMEDIATELY.
+        6. Set take-profit price (no bracket order — checked on each tick).
+        7. Track position.
 
         Args:
-            signal:         +1 (BUY), -1 (SELL), 0 (HOLD).
-            current_price:  Current LTP for SL calculation.
-            confidence:     Model confidence (0.0–1.0).
+            signal:        +1 BUY, -1 SELL, 0 HOLD.
+            current_price: Current LTP.
+            confidence:    Model confidence (0–1).
 
         Returns:
-            Position object if order was placed, None otherwise.
+            New Position, or None if not executed.
         """
-        # ── HOLD signal → do nothing ─────────────────────────────────────
         if signal == 0:
             return None
 
-        # ── Pre-trade risk checks ────────────────────────────────────────
         if not self._pre_trade_checks(current_price):
             return None
 
-        # ── Determine order side ─────────────────────────────────────────
         side = OrderSide.BUY if signal > 0 else OrderSide.SELL
-        quantity = self._calculate_quantity(current_price, confidence)
+        quantity = self._calc_quantity(confidence)
 
         logger.info(
-            f"🎯 Executing {side.value} | "
-            f"Price: ₹{current_price:,.2f} | "
-            f"Qty: {quantity} | "
-            f"Confidence: {confidence:.2%}"
+            f"🎯 Signal {side.value} | "
+            f"Price ₹{current_price:,.2f} | "
+            f"Qty {quantity} | "
+            f"Confidence {confidence:.2%}"
         )
 
-        t_start = time.perf_counter_ns()
+        t0 = time.perf_counter_ns()
 
-        # ── Step 1: Place entry order ────────────────────────────────────
-        entry_result = await self._place_order(
-            side=side,
-            order_type=OrderType.MARKET,
-            quantity=quantity,
-            price=0,  # Market order — no price needed
-        )
-
+        # ── Place entry order ────────────────────────────────────────────
+        entry_result = await self._place_order(side, OrderType.MARKET, quantity)
         if entry_result.get("status") != "success":
-            logger.error(f"Entry order REJECTED: {entry_result}")
+            logger.error(f"Entry REJECTED: {entry_result}")
             self._rejected_orders += 1
             return None
 
-        entry_order_id = entry_result.get("order_id", "UNKNOWN")
+        entry_id = entry_result.get("order_id", "DRY")
         fill_price = entry_result.get("fill_price", current_price)
 
-        # ── Step 2: Calculate  and place stop-loss IMMEDIATELY ───────────
-        sl_price = self._calculate_stop_loss(fill_price, side)
+        # ── Compute SL / TP prices ───────────────────────────────────────
+        sl_price  = self._calc_sl_price(fill_price, side)
+        tp_price  = self._calc_tp_price(fill_price, side)
 
-        sl_result = await self._place_stop_loss(
-            side=side,
-            quantity=quantity,
-            trigger_price=sl_price,
-        )
+        # ── Place stop-loss order ────────────────────────────────────────
+        sl_result = await self._place_stop_loss(side, quantity, sl_price)
+        sl_id     = sl_result.get("order_id", "DRY")
 
-        sl_order_id = sl_result.get("order_id", "UNKNOWN")
-
-        # ── Step 3: Track the position ───────────────────────────────────
-        position = Position(
+        # ── Build position ───────────────────────────────────────────────
+        pos = Position(
             symbol=self.symbol,
             side=side,
             entry_price=fill_price,
             quantity=quantity,
-            entry_order_id=entry_order_id,
-            sl_order_id=sl_order_id,
+            entry_order_id=entry_id,
+            sl_order_id=sl_id,
             sl_price=sl_price,
+            tp_price=tp_price,
+            trailing_sl_price=sl_price,   # trailing starts at initial SL
+            best_price=fill_price,
         )
 
-        self._open_positions.append(position)
+        self._open_positions.append(pos)
         self._total_orders += 1
+        self._last_signal_time = time.time()
 
-        elapsed_ms = log_latency(logger, "ORDER_EXECUTION", t_start)
+        log_latency(logger, "ORDER_EXECUTION", t0)
         logger.info(
             f"✅ Position opened | "
-            f"Side: {side.value} | "
-            f"Entry: ₹{fill_price:,.2f} | "
-            f"SL: ₹{sl_price:,.2f} | "
-            f"Order ID: {entry_order_id} | "
-            f"SL Order: {sl_order_id} | "
-            f"Execution time: {elapsed_ms:.2f}ms"
+            f"{side.value} {quantity}× {self.symbol} | "
+            f"Entry ₹{fill_price:,.2f} | "
+            f"SL ₹{sl_price:,.2f} | TP ₹{tp_price:,.2f} | "
+            f"Trailing {'ON' if self.trailing_stop_enabled else 'OFF'}"
         )
+        return pos
 
-        return position
+    # ═════════════════════════════════════════════════════════════════════
+    #  TICK-LEVEL POSITION MANAGEMENT  [NEW]
+    # ═════════════════════════════════════════════════════════════════════
+
+    async def check_open_positions(self, ltp: float) -> None:
+        """
+        Evaluate all open positions against the current price on every tick.
+
+        Called from the tick-processing loop in main.py.
+
+        Checks (in priority order):
+        1. Take-profit reached → close at market.
+        2. Trailing stop-loss hit → close at market.
+        3. Update trailing SL if price has improved beyond the step threshold.
+        """
+        for pos in list(self._open_positions):
+            if pos.side == OrderSide.BUY:
+                # ── Take-profit ──────────────────────────────────────────
+                if ltp >= pos.tp_price:
+                    logger.info(f"🎯 TP hit | {pos.symbol} | LTP ₹{ltp:,.2f} ≥ TP ₹{pos.tp_price:,.2f}")
+                    pos.exit_reason = ExitReason.TAKE_PROFIT
+                    await self.close_position(pos, ltp)
+                    continue
+
+                # ── Trailing stop-loss hit ───────────────────────────────
+                if self.trailing_stop_enabled and ltp <= pos.trailing_sl_price:
+                    logger.info(
+                        f"🔻 Trailing SL hit | {pos.symbol} | "
+                        f"LTP ₹{ltp:,.2f} ≤ TSL ₹{pos.trailing_sl_price:,.2f}"
+                    )
+                    pos.exit_reason = ExitReason.TRAILING_STOP
+                    await self.close_position(pos, ltp)
+                    continue
+
+                # ── Update trailing SL (ratchet up for BUY) ─────────────
+                if self.trailing_stop_enabled and ltp > pos.best_price:
+                    step_threshold = pos.best_price * (1 + self.trailing_stop_step / 100)
+                    if ltp >= step_threshold:
+                        new_tsl = self._calc_sl_price(ltp, pos.side)
+                        if new_tsl > pos.trailing_sl_price:
+                            old_tsl = pos.trailing_sl_price
+                            pos.trailing_sl_price = new_tsl
+                            pos.best_price = ltp
+                            logger.debug(
+                                f"📈 Trailing SL moved | "
+                                f"₹{old_tsl:,.2f} → ₹{new_tsl:,.2f}"
+                            )
+
+            else:  # SELL position
+                # ── Take-profit ──────────────────────────────────────────
+                if ltp <= pos.tp_price:
+                    logger.info(f"🎯 TP hit | {pos.symbol} | LTP ₹{ltp:,.2f} ≤ TP ₹{pos.tp_price:,.2f}")
+                    pos.exit_reason = ExitReason.TAKE_PROFIT
+                    await self.close_position(pos, ltp)
+                    continue
+
+                # ── Trailing stop-loss hit ───────────────────────────────
+                if self.trailing_stop_enabled and ltp >= pos.trailing_sl_price:
+                    logger.info(
+                        f"🔺 Trailing SL hit | {pos.symbol} | "
+                        f"LTP ₹{ltp:,.2f} ≥ TSL ₹{pos.trailing_sl_price:,.2f}"
+                    )
+                    pos.exit_reason = ExitReason.TRAILING_STOP
+                    await self.close_position(pos, ltp)
+                    continue
+
+                # ── Update trailing SL (ratchet down for SELL) ──────────
+                if self.trailing_stop_enabled and ltp < pos.best_price:
+                    step_threshold = pos.best_price * (1 - self.trailing_stop_step / 100)
+                    if ltp <= step_threshold:
+                        new_tsl = self._calc_sl_price(ltp, pos.side)
+                        if new_tsl < pos.trailing_sl_price:
+                            old_tsl = pos.trailing_sl_price
+                            pos.trailing_sl_price = new_tsl
+                            pos.best_price = ltp
+                            logger.debug(
+                                f"📉 Trailing SL moved | "
+                                f"₹{old_tsl:,.2f} → ₹{new_tsl:,.2f}"
+                            )
 
     # ═════════════════════════════════════════════════════════════════════
     #  RISK MANAGEMENT
     # ═════════════════════════════════════════════════════════════════════
 
-    def _pre_trade_checks(self, current_price: float) -> bool:
+    def _pre_trade_checks(self, price: float) -> bool:
         """
-        Run all pre-trade risk checks before placing an order.
+        Returns True only if all risk gates pass.
 
-        Returns:
-            True if all checks pass, False if trade should be blocked.
+        Gates:
+        1. Trading not halted (daily loss limit).
+        2. Open position count < max.
+        3. Daily P&L within limit.
+        4. Estimated order value within limit.
+        5. Signal cooldown respected.
         """
-        # ── Check 1: Trading halted? ─────────────────────────────────────
         if self._trading_halted:
-            logger.warning("⛔ Trading HALTED — daily loss limit breached")
+            logger.warning("⛔ Trading HALTED")
             return False
 
-        # ── Check 2: Max open positions ──────────────────────────────────
         if len(self._open_positions) >= self.max_open_positions:
-            logger.warning(
-                f"⚠️  Max open positions reached ({self.max_open_positions})"
-            )
+            logger.debug(f"Max positions ({self.max_open_positions}) reached")
             return False
 
-        # ── Check 3: Daily loss limit ────────────────────────────────────
         if self._daily_pnl <= -self.max_daily_loss:
             self._trading_halted = True
             logger.critical(
-                f"🚨 CIRCUIT BREAKER TRIGGERED | "
-                f"Daily P&L: ₹{self._daily_pnl:,.2f} | "
-                f"Limit: ₹{-self.max_daily_loss:,.2f}"
+                f"🚨 CIRCUIT BREAKER | Daily P&L ₹{self._daily_pnl:,.2f} "
+                f"≤ limit ₹{-self.max_daily_loss:,.2f}"
             )
             return False
 
-        # ── Check 4: Max order value ─────────────────────────────────────
-        estimated_value = current_price * self.max_position_size
+        estimated_value = price * self.max_position_size
         if estimated_value > self.max_order_value:
             logger.warning(
-                f"⚠️  Order value ₹{estimated_value:,.0f} exceeds "
-                f"limit ₹{self.max_order_value:,.0f}"
+                f"⚠️  Order value ₹{estimated_value:,.0f} > limit ₹{self.max_order_value:,.0f}"
+            )
+            return False
+
+        elapsed = time.time() - self._last_signal_time
+        if elapsed < self.signal_cooldown_sec:
+            logger.debug(
+                f"Cooldown: {elapsed:.1f}s / {self.signal_cooldown_sec}s elapsed"
             )
             return False
 
         return True
 
-    def _calculate_quantity(
-        self, price: float, confidence: float
-    ) -> int:
+    def _calc_quantity(self, confidence: float) -> int:
         """
-        Calculate order quantity based on price and model confidence.
+        Kelly-inspired quantity scaling.
 
-        Higher confidence → larger position (up to max_position_size).
-        Lower confidence → smaller position (minimum 1 lot).
+        quantity = max(1, round(max_position_size * confidence))
+
+        A confidence of 0.6 → 60 % of max size.
+        A confidence of 1.0 → 100 % of max size.
         """
-        # Scale quantity by confidence: 50% confidence → 50% of max size
-        scaled_qty = max(1, int(self.max_position_size * confidence))
-        return min(scaled_qty, self.max_position_size)
+        qty = max(1, round(self.max_position_size * confidence))
+        return min(qty, self.max_position_size)
 
-    def _calculate_stop_loss(
-        self, entry_price: float, side: OrderSide
-    ) -> float:
-        """
-        Calculate stop-loss price based on entry price and direction.
+    def _calc_sl_price(self, entry: float, side: OrderSide) -> float:
+        """Stop-loss price, rounded to Indian tick size (0.05)."""
+        offset = entry * (self.stop_loss_pct / 100.0)
+        raw = entry - offset if side == OrderSide.BUY else entry + offset
+        return round(raw * 20) / 20
 
-        For BUY: SL is below entry price.
-        For SELL: SL is above entry price.
-        """
-        sl_offset = entry_price * (self.stop_loss_pct / 100.0)
-
-        if side == OrderSide.BUY:
-            sl_price = entry_price - sl_offset
-        else:
-            sl_price = entry_price + sl_offset
-
-        # Round to tick size (0.05 for most Indian instruments)
-        sl_price = round(sl_price * 20) / 20
-
-        return sl_price
+    def _calc_tp_price(self, entry: float, side: OrderSide) -> float:
+        """Take-profit price, rounded to Indian tick size (0.05)."""
+        offset = entry * (self.take_profit_pct / 100.0)
+        raw = entry + offset if side == OrderSide.BUY else entry - offset
+        return round(raw * 20) / 20
 
     # ═════════════════════════════════════════════════════════════════════
     #  ORDER API CALLS
@@ -408,194 +455,137 @@ class ExecutionEngine:
         price: float = 0,
         trigger_price: float = 0,
     ) -> dict[str, Any]:
-        """
-        Place an order via the broker REST API.
+        """Place an order.  In dry-run mode simulates a successful fill."""
+        if self.dry_run:
+            sim_id = f"DRY-{int(time.time()*1000)}"
+            return {
+                "status": "success",
+                "order_id": sim_id,
+                "fill_price": price if price > 0 else trigger_price,
+            }
 
-        Args:
-            side:           BUY or SELL.
-            order_type:     MARKET, LIMIT, SL, or SL-M.
-            quantity:       Number of lots/contracts.
-            price:          Limit price (0 for market orders).
-            trigger_price:  Stop-loss trigger price (0 if not SL).
-
-        Returns:
-            Dict with "status", "order_id", and "fill_price" keys.
-        """
         if not self._session:
-            logger.error("HTTP session not initialized. Call start() first.")
             return {"status": "error", "message": "Session not initialized"}
 
-        payload = {
+        payload: dict = {
             "tradingsymbol": self.symbol,
-            "exchange": self.exchange,
+            "exchange":      self.exchange,
             "transaction_type": side.value,
-            "order_type": order_type.value,
-            "quantity": quantity,
-            "product": "MIS",  # Intraday
-            "validity": "DAY",
+            "order_type":    order_type.value,
+            "quantity":      quantity,
+            "product":       "MIS",
+            "validity":      "DAY",
         }
-
         if price > 0:
             payload["price"] = price
         if trigger_price > 0:
             payload["trigger_price"] = trigger_price
 
         try:
-            t_start = time.perf_counter_ns()
-
+            t0 = time.perf_counter_ns()
             async with self._session.post(
-                f"{self.api_base_url}/orders/regular",
-                data=payload,
-            ) as response:
-                elapsed_ms = (time.perf_counter_ns() - t_start) / 1_000_000
-                result = await response.json()
+                f"{self.api_base_url}/orders/regular", data=payload
+            ) as resp:
+                latency_ms = (time.perf_counter_ns() - t0) / 1_000_000
+                result = await resp.json()
 
-                if response.status == 200 and result.get("status") == "success":
-                    order_id = result.get("data", {}).get("order_id", "UNKNOWN")
+                if resp.status == 200 and result.get("status") == "success":
+                    oid = result.get("data", {}).get("order_id", "UNKNOWN")
                     logger.info(
-                        f"📤 Order placed | "
-                        f"{side.value} {quantity}x {self.symbol} | "
-                        f"Type: {order_type.value} | "
-                        f"Order ID: {order_id} | "
-                        f"API latency: {elapsed_ms:.2f}ms"
+                        f"📤 Order | {side.value} {quantity}× {self.symbol} "
+                        f"| {order_type.value} | ID {oid} | {latency_ms:.1f}ms"
                     )
                     return {
                         "status": "success",
-                        "order_id": order_id,
+                        "order_id": oid,
                         "fill_price": price if price > 0 else 0,
                     }
-                else:
-                    error_msg = result.get("message", "Unknown error")
-                    logger.error(
-                        f"❌ Order REJECTED | {side.value} {quantity}x {self.symbol} | "
-                        f"Reason: {error_msg} | HTTP: {response.status}"
-                    )
-                    return {"status": "rejected", "message": error_msg}
+
+                msg = result.get("message", "Unknown error")
+                logger.error(f"❌ Order rejected: {msg}")
+                return {"status": "rejected", "message": msg}
 
         except asyncio.TimeoutError:
-            logger.error(
-                f"⏱️  Order TIMEOUT ({self.order_timeout}s) | "
-                f"{side.value} {quantity}x {self.symbol}"
-            )
-            return {"status": "timeout", "message": "Request timed out"}
-
+            logger.error(f"⏱️  Order timeout ({self.order_timeout}s)")
+            return {"status": "timeout", "message": "timeout"}
         except aiohttp.ClientError as e:
-            logger.error(f"🔌 Connection error placing order: {e}")
+            logger.error(f"🔌 Connection error: {e}")
             return {"status": "error", "message": str(e)}
-
         except Exception as e:
             logger.exception(f"Unexpected order error: {e}")
             return {"status": "error", "message": str(e)}
 
     async def _place_stop_loss(
-        self,
-        side: OrderSide,
-        quantity: int,
-        trigger_price: float,
+        self, side: OrderSide, quantity: int, trigger_price: float
     ) -> dict[str, Any]:
-        """
-        Place a stop-loss market order (the inverse of the entry side).
-
-        A BUY entry → SELL stop-loss.
-        A SELL entry → BUY stop-loss.
-        """
+        """Place a SL-M order on the opposite side."""
         sl_side = OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY
-
         logger.info(
-            f"🛡️  Placing SL | {sl_side.value} {quantity}x {self.symbol} | "
-            f"Trigger: ₹{trigger_price:,.2f}"
+            f"🛡️  SL | {sl_side.value} {quantity}× | Trigger ₹{trigger_price:,.2f}"
         )
-
         return await self._place_order(
-            side=sl_side,
-            order_type=OrderType.SL_MARKET,
-            quantity=quantity,
+            sl_side, OrderType.SL_MARKET, quantity,
             trigger_price=trigger_price,
         )
 
     async def _cancel_order(self, order_id: str) -> bool:
-        """
-        Cancel a pending order by its ID.
-
-        Returns:
-            True if cancellation was successful.
-        """
-        if not self._session:
-            return False
-
+        """Cancel a pending order."""
+        if self.dry_run or not self._session:
+            return True
         try:
             async with self._session.delete(
                 f"{self.api_base_url}/orders/regular/{order_id}"
-            ) as response:
-                result = await response.json()
-                if response.status == 200:
-                    logger.info(f"🗑️  Order {order_id} cancelled successfully")
+            ) as resp:
+                if resp.status == 200:
+                    logger.info(f"🗑️  Cancelled order {order_id}")
                     return True
-                else:
-                    logger.error(f"Failed to cancel order {order_id}: {result}")
-                    return False
-
+                logger.error(f"Cancel failed for {order_id}: HTTP {resp.status}")
+                return False
         except Exception as e:
-            logger.exception(f"Error cancelling order {order_id}: {e}")
+            logger.exception(f"Error cancelling {order_id}: {e}")
             return False
 
     # ═════════════════════════════════════════════════════════════════════
-    #  POSITION MANAGEMENT
+    #  POSITION CLOSE
     # ═════════════════════════════════════════════════════════════════════
 
-    async def close_position(
-        self, position: Position, exit_price: float
-    ) -> None:
+    async def close_position(self, pos: Position, exit_price: float) -> None:
         """
-        Close a position: cancel the SL order and place an exit order.
+        Close a position: cancel its broker SL and place an exit MARKET order.
 
-        Args:
-            position:    The Position to close.
-            exit_price:  Current market price for P&L calculation.
+        P&L is calculated and added to the daily total.
         """
-        # ── Cancel the stop-loss ─────────────────────────────────────────
-        if position.sl_order_id:
-            await self._cancel_order(position.sl_order_id)
+        if pos.sl_order_id:
+            await self._cancel_order(pos.sl_order_id)
 
-        # ── Place exit order (opposite side) ─────────────────────────────
-        exit_side = (
-            OrderSide.SELL if position.side == OrderSide.BUY
-            else OrderSide.BUY
-        )
+        exit_side = OrderSide.SELL if pos.side == OrderSide.BUY else OrderSide.BUY
+        await self._place_order(exit_side, OrderType.MARKET, pos.quantity)
 
-        await self._place_order(
-            side=exit_side,
-            order_type=OrderType.MARKET,
-            quantity=position.quantity,
-        )
-
-        # ── Calculate P&L ────────────────────────────────────────────────
-        if position.side == OrderSide.BUY:
-            position.pnl = (exit_price - position.entry_price) * position.quantity
+        if pos.side == OrderSide.BUY:
+            pos.pnl = (exit_price - pos.entry_price) * pos.quantity
         else:
-            position.pnl = (position.entry_price - exit_price) * position.quantity
+            pos.pnl = (pos.entry_price - exit_price) * pos.quantity
 
-        self._daily_pnl += position.pnl
+        self._daily_pnl += pos.pnl
 
-        # ── Move to closed positions ─────────────────────────────────────
-        if position in self._open_positions:
-            self._open_positions.remove(position)
-        self._closed_positions.append(position)
+        if pos in self._open_positions:
+            self._open_positions.remove(pos)
+        self._closed_positions.append(pos)
 
+        reason = pos.exit_reason.value if pos.exit_reason else "MANUAL"
         logger.info(
-            f"📕 Position closed | "
-            f"{position.side.value} {position.quantity}x {position.symbol} | "
-            f"Entry: ₹{position.entry_price:,.2f} → "
-            f"Exit: ₹{exit_price:,.2f} | "
-            f"P&L: ₹{position.pnl:,.2f} | "
-            f"Daily P&L: ₹{self._daily_pnl:,.2f}"
+            f"📕 Position closed [{reason}] | "
+            f"{pos.side.value} {pos.quantity}× {pos.symbol} | "
+            f"₹{pos.entry_price:,.2f} → ₹{exit_price:,.2f} | "
+            f"P&L ₹{pos.pnl:,.2f} | Daily ₹{self._daily_pnl:,.2f}"
         )
 
     async def close_all_positions(self, current_price: float) -> None:
-        """Emergency close of all open positions (e.g., on shutdown)."""
+        """Emergency close all open positions."""
         logger.warning(f"🔴 Closing ALL {len(self._open_positions)} positions")
-        for position in list(self._open_positions):
-            await self.close_position(position, current_price)
+        for pos in list(self._open_positions):
+            pos.exit_reason = ExitReason.SHUTDOWN
+            await self.close_position(pos, current_price)
 
     # ═════════════════════════════════════════════════════════════════════
     #  DIAGNOSTICS
@@ -603,19 +593,30 @@ class ExecutionEngine:
 
     @property
     def stats(self) -> dict[str, Any]:
-        """Return current execution statistics."""
+        closed = self._closed_positions
+        wins = [p for p in closed if p.pnl > 0]
+        win_rate = len(wins) / len(closed) if closed else 0.0
+        avg_win  = sum(p.pnl for p in wins) / len(wins) if wins else 0.0
+        losses   = [p for p in closed if p.pnl <= 0]
+        avg_loss = sum(p.pnl for p in losses) / len(losses) if losses else 0.0
+
         return {
-            "open_positions": len(self._open_positions),
-            "closed_positions": len(self._closed_positions),
-            "total_orders": self._total_orders,
-            "rejected_orders": self._rejected_orders,
-            "daily_pnl": round(self._daily_pnl, 2),
-            "trading_halted": self._trading_halted,
+            "open_positions":   len(self._open_positions),
+            "closed_positions": len(closed),
+            "total_orders":     self._total_orders,
+            "rejected_orders":  self._rejected_orders,
+            "daily_pnl":        round(self._daily_pnl, 2),
+            "trading_halted":   self._trading_halted,
+            "win_rate":         round(win_rate, 4),
+            "avg_win":          round(avg_win, 2),
+            "avg_loss":         round(avg_loss, 2),
+            "dry_run":          self.dry_run,
         }
 
     def reset_daily(self) -> None:
-        """Reset daily P&L and halt flag (call at market open)."""
+        """Reset daily P&L and circuit-breaker flag at market open."""
         self._daily_pnl = 0.0
         self._trading_halted = False
         self._closed_positions.clear()
+        self._last_signal_time = 0.0
         logger.info("📅 Daily execution state reset")

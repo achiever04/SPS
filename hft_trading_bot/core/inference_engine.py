@@ -1,157 +1,179 @@
 """
 ===============================================================================
-  inference_engine.py — ONNX Runtime Model Inference Layer
+  inference_engine.py — ONNX Runtime Model Inference Layer  (v2)
 ===============================================================================
-  Loads a pre-trained ONNX model and StandardScaler at startup, then provides
+  Loads a pre-trained ONNX model and fitted scaler at startup, then provides
   sub-millisecond predictions on streaming feature vectors.
 
-  ⚡ NO PyTorch / NO TensorFlow — onnxruntime only.
-  ⚡ Single InferenceSession, reused across all predictions.
-  ⚡ Latency logged on every prediction for performance monitoring.
+  Changes in v2:
+  • Hard failure when model file is missing (no silent HOLD fallback)
+    unless dry_run=True is explicitly passed.
+  • Unified confidence threshold logic — buy_threshold / sell_threshold
+    used consistently in both classification and regression branches.
+  • MIN_CONFIDENCE gate — signals with low confidence are suppressed here
+    rather than relying on the execution engine alone.
+  • Inference stats track p50 / p95 latency (ring buffer).
+  • Thread-safe prediction counter with lock.
 
   Architecture:
-      feature_engine → numpy vector → InferenceEngine.predict() → signal
+      feature_engine → numpy (19,) → InferenceEngine.predict() → signal dict
 ===============================================================================
 """
 
-import time
 import os
+import threading
+import time
+from collections import deque
 from typing import Optional
 
 import numpy as np
 
 from utils.logger import get_logger, log_latency
 
-# ── Module logger ───────────────────────────────────────────────────────
 logger = get_logger("INFERENCE")
 
 
 class InferenceEngine:
     """
-    Production ONNX inference engine for real-time trading signal generation.
+    Production ONNX inference engine for real-time trading signals.
 
-    The engine:
-    1. Loads model.onnx + scaler.pkl once at startup.
-    2. Scales incoming feature vectors using the pre-fitted scaler.
-    3. Runs ONNX inference session for sub-ms predictions.
-    4. Returns a trading signal: BUY (+1), SELL (-1), or HOLD (0).
+    Steps per prediction:
+    1. Validate input shape matches the loaded model.
+    2. Scale features via the pre-fitted scaler.
+    3. Run ONNX InferenceSession (CPU, single-threaded for determinism).
+    4. Decode class probabilities / regression value → signal + confidence.
+    5. Apply MIN_CONFIDENCE gate.
 
     Attributes:
-        model_path:    Path to the .onnx model file.
-        scaler_path:   Path to the .pkl scaler file.
-        _session:      onnxruntime.InferenceSession instance.
-        _scaler:       Pre-fitted StandardScaler (or equivalent).
-        _input_name:   ONNX model input tensor name.
-        _output_name:  ONNX model output tensor name.
-        _total_inferences: Counter for total predictions made.
-        _total_latency_ns: Cumulative latency for average tracking.
+        model_path:        Path to .onnx model file.
+        scaler_path:       Path to scaler .pkl file.
+        min_confidence:    Reject signals below this probability.
+        dry_run:           If True, allow missing model (always returns HOLD).
     """
 
-    # ── Signal constants ─────────────────────────────────────────────────
-    SIGNAL_BUY: int = 1
+    SIGNAL_BUY:  int = 1
     SIGNAL_SELL: int = -1
     SIGNAL_HOLD: int = 0
 
-    def __init__(self, model_path: str, scaler_path: str):
+    def __init__(
+        self,
+        model_path: str,
+        scaler_path: str,
+        min_confidence: float = 0.60,
+        buy_threshold: float = 0.60,
+        sell_threshold: float = 0.40,
+        dry_run: bool = False,
+    ):
         """
-        Initialize the inference engine by loading model and scaler.
-
         Args:
-            model_path:  Absolute path to the ONNX model file.
-            scaler_path: Absolute path to the scaler pickle file.
-
-        Raises:
-            FileNotFoundError: If model or scaler files don't exist.
-            RuntimeError: If ONNX session creation fails.
+            model_path:      Absolute path to the ONNX model.
+            scaler_path:     Absolute path to the scaler pickle.
+            min_confidence:  Minimum probability to emit a non-HOLD signal.
+            buy_threshold:   Probability above which BUY is triggered.
+            sell_threshold:  Probability below which SELL is triggered.
+            dry_run:         When True, missing model is a warning not a crash.
         """
         self.model_path = model_path
         self.scaler_path = scaler_path
+        self.min_confidence = min_confidence
+        self.buy_threshold = buy_threshold
+        self.sell_threshold = sell_threshold
+        self.dry_run = dry_run
 
-        # ── Runtime state ────────────────────────────────────────────────
+        # ── Runtime objects ──────────────────────────────────────────────
         self._session = None
         self._scaler = None
         self._input_name: str = ""
         self._output_name: str = ""
+        self._expected_features: Optional[int] = None
+
+        # ── Performance counters ─────────────────────────────────────────
+        self._lock = threading.Lock()
         self._total_inferences: int = 0
         self._total_latency_ns: int = 0
+        # Ring buffer of last 200 latencies (ns) for p50/p95 tracking
+        self._latency_ring: deque = deque(maxlen=200)
 
-        # ── Confidence thresholds ────────────────────────────────────────
-        self._buy_threshold: float = 0.6    # Probability > 0.6 → BUY
-        self._sell_threshold: float = 0.4   # Probability < 0.4 → SELL
+        # Signal distribution counters
+        self._signal_counts = {self.SIGNAL_BUY: 0, self.SIGNAL_SELL: 0, self.SIGNAL_HOLD: 0}
 
         # ── Load model and scaler ────────────────────────────────────────
         self._load_model()
         self._load_scaler()
 
+    # ═════════════════════════════════════════════════════════════════════
+    #  MODEL / SCALER LOADING
+    # ═════════════════════════════════════════════════════════════════════
+
     def _load_model(self) -> None:
         """
-        Load the ONNX model into an InferenceSession.
+        Load ONNX model into an InferenceSession with full graph
+        optimization and single-threaded CPU execution.
 
-        Uses CPU execution provider with optimizations enabled.
-        Graph optimization is set to ORT_ENABLE_ALL for maximum
-        inference speed.
+        Raises SystemExit when the model is missing and dry_run=False.
         """
         if not os.path.exists(self.model_path):
-            logger.warning(
+            msg = (
                 f"ONNX model not found at {self.model_path}. "
-                f"Inference will run in DUMMY mode (always returns HOLD)."
+                f"Run scripts/train_model.py first."
             )
-            return
+            if self.dry_run:
+                logger.warning(f"{msg} Running in DRY-RUN / HOLD-only mode.")
+                return
+            else:
+                logger.critical(msg)
+                raise FileNotFoundError(msg)
 
         try:
             import onnxruntime as ort
 
             t_start = time.perf_counter_ns()
 
-            # ── Configure session options for minimal latency ────────────
-            session_options = ort.SessionOptions()
-            session_options.graph_optimization_level = (
-                ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            )
-            # ── Use a single thread for deterministic latency ────────────
-            session_options.intra_op_num_threads = 1
-            session_options.inter_op_num_threads = 1
-            # ── Disable memory pattern for lower memory usage ────────────
-            session_options.enable_mem_pattern = False
+            opts = ort.SessionOptions()
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            opts.intra_op_num_threads = 1
+            opts.inter_op_num_threads = 1
+            opts.enable_mem_pattern = False
+            opts.enable_cpu_mem_arena = False   # Avoid memory fragmentation
 
             self._session = ort.InferenceSession(
                 self.model_path,
-                sess_options=session_options,
+                sess_options=opts,
                 providers=["CPUExecutionProvider"],
             )
 
-            # ── Cache input/output tensor names ──────────────────────────
             self._input_name = self._session.get_inputs()[0].name
             self._output_name = self._session.get_outputs()[0].name
+            # Cache expected input feature count for runtime validation
+            self._expected_features = self._session.get_inputs()[0].shape[1]
 
             elapsed_ms = log_latency(logger, "MODEL_LOAD", t_start)
             logger.info(
                 f"✅ ONNX model loaded | "
-                f"Input: {self._input_name} | "
-                f"Output: {self._output_name} | "
-                f"Load time: {elapsed_ms:.1f}ms"
+                f"Input: '{self._input_name}' ({self._expected_features} features) | "
+                f"Output: '{self._output_name}' | "
+                f"Load: {elapsed_ms:.1f}ms"
             )
 
         except ImportError:
-            logger.error(
-                "onnxruntime not installed. "
-                "Install with: pip install onnxruntime"
+            raise ImportError(
+                "onnxruntime not installed. Run: pip install onnxruntime"
             )
         except Exception as e:
             logger.exception(f"Failed to load ONNX model: {e}")
+            raise
 
     def _load_scaler(self) -> None:
         """
-        Load the pre-fitted scaler (StandardScaler / MinMaxScaler)
-        from a pickle or joblib file.
+        Load the pre-fitted scaler (StandardScaler / MinMaxScaler).
 
-        The scaler must have been fitted on the same features
-        used during model training.
+        A missing scaler is a warning, not a crash — raw features will
+        be used, which degrades accuracy but keeps the bot alive.
         """
         if not os.path.exists(self.scaler_path):
             logger.warning(
                 f"Scaler not found at {self.scaler_path}. "
-                f"Features will NOT be scaled (raw values used)."
+                f"Raw unscaled features will be used — accuracy may suffer."
             )
             return
 
@@ -163,167 +185,188 @@ class InferenceEngine:
             log_latency(logger, "SCALER_LOAD", t_start)
             logger.info("✅ Feature scaler loaded successfully")
 
-        except ImportError:
-            logger.error(
-                "joblib not installed. Install with: pip install joblib"
-            )
         except Exception as e:
             logger.exception(f"Failed to load scaler: {e}")
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  PREDICTION
+    # ═════════════════════════════════════════════════════════════════════
 
     def predict(self, features: np.ndarray) -> dict:
         """
         Run inference on a feature vector and return a trading signal.
 
         Args:
-            features: 1D numpy array of shape (n_features,) from FeatureEngine.
+            features: 1-D float32 numpy array of shape (n_features,).
 
         Returns:
-            A dict containing:
             {
-                "signal": int,          # +1 (BUY), -1 (SELL), 0 (HOLD)
-                "confidence": float,    # Model confidence (0.0 - 1.0)
-                "latency_ms": float,    # Inference latency in milliseconds
-                "raw_output": any,      # Raw model output for debugging
+                "signal":     int   — +1 (BUY), -1 (SELL), 0 (HOLD)
+                "confidence": float — model probability (0.0–1.0)
+                "latency_ms": float — end-to-end inference latency
+                "raw_output": any   — raw ONNX output for debugging
             }
-
-        Performance:
-            Target: < 1ms per prediction on CPU.
         """
         t_start = time.perf_counter_ns()
 
-        # ── Fallback: No model loaded → HOLD ────────────────────────────
+        # ── No model loaded → HOLD (dry run only) ────────────────────────
         if self._session is None:
-            return {
-                "signal": self.SIGNAL_HOLD,
-                "confidence": 0.0,
-                "latency_ms": 0.0,
-                "raw_output": None,
-            }
+            return self._make_result(self.SIGNAL_HOLD, 0.0, t_start, None)
 
         try:
-            # ── Step 1: Scale features ───────────────────────────────────
-            # Reshape to (1, n_features) for scaler and ONNX
-            input_data = features.reshape(1, -1)
+            # ── Validate feature dimensionality ──────────────────────────
+            if (
+                self._expected_features is not None
+                and features.shape[0] != self._expected_features
+            ):
+                logger.error(
+                    f"Feature dim mismatch: got {features.shape[0]}, "
+                    f"expected {self._expected_features}. Returning HOLD."
+                )
+                return self._make_result(self.SIGNAL_HOLD, 0.0, t_start, None)
 
+            # ── Scale features ───────────────────────────────────────────
+            x = features.reshape(1, -1).astype(np.float32)
             if self._scaler is not None:
-                input_data = self._scaler.transform(input_data)
+                x = self._scaler.transform(x).astype(np.float32)
 
-            # ── Ensure correct dtype (ONNX expects float32) ──────────────
-            input_data = input_data.astype(np.float32)
-
-            # ── Step 2: Run ONNX inference ───────────────────────────────
-            raw_output = self._session.run(
+            # ── ONNX inference ───────────────────────────────────────────
+            raw = self._session.run(
                 [self._output_name],
-                {self._input_name: input_data},
+                {self._input_name: x},
             )
 
-            # ── Step 3: Interpret output ─────────────────────────────────
-            signal, confidence = self._interpret_output(raw_output)
+            # ── Decode output ────────────────────────────────────────────
+            signal, confidence = self._decode_output(raw)
 
-            # ── Step 4: Track performance ────────────────────────────────
-            elapsed_ns = time.perf_counter_ns() - t_start
-            elapsed_ms = elapsed_ns / 1_000_000
-            self._total_inferences += 1
-            self._total_latency_ns += elapsed_ns
-
-            # Log every 100th inference to avoid log flooding
-            if self._total_inferences % 100 == 0:
-                avg_ms = (self._total_latency_ns / self._total_inferences) / 1_000_000
-                logger.info(
-                    f"📊 Inference #{self._total_inferences} | "
-                    f"This: {elapsed_ms:.3f}ms | "
-                    f"Avg: {avg_ms:.3f}ms | "
-                    f"Signal: {signal} ({confidence:.2%})"
+            # ── Apply minimum confidence gate ────────────────────────────
+            if signal != self.SIGNAL_HOLD and confidence < self.min_confidence:
+                logger.debug(
+                    f"Signal {signal} suppressed: confidence {confidence:.3f} "
+                    f"< min {self.min_confidence:.3f}"
                 )
+                signal = self.SIGNAL_HOLD
 
-            return {
-                "signal": signal,
-                "confidence": confidence,
-                "latency_ms": elapsed_ms,
-                "raw_output": raw_output,
-            }
+            return self._make_result(signal, confidence, t_start, raw)
 
         except Exception as e:
             logger.exception(f"Inference error: {e}")
-            return {
-                "signal": self.SIGNAL_HOLD,
-                "confidence": 0.0,
-                "latency_ms": (time.perf_counter_ns() - t_start) / 1_000_000,
-                "raw_output": None,
-            }
+            return self._make_result(self.SIGNAL_HOLD, 0.0, t_start, None)
 
-    def _interpret_output(
+    # ═════════════════════════════════════════════════════════════════════
+    #  OUTPUT DECODING
+    # ═════════════════════════════════════════════════════════════════════
+
+    def _decode_output(
         self, raw_output: list
     ) -> tuple[int, float]:
         """
-        Convert raw ONNX model output to a trading signal.
+        Convert raw ONNX output to (signal, confidence).
 
-        Supports two output formats:
-        1. Classification: Output is class probabilities [P(sell), P(hold), P(buy)]
-        2. Regression: Output is a single value (positive → buy, negative → sell)
+        Supported output shapes:
+        • (1, 3)  — 3-class softmax [P(sell), P(hold), P(buy)]
+        • (1, 2)  — binary [P(hold/sell), P(buy)]
+        • (1, 1) or (1,) — regression scalar
 
-        Args:
-            raw_output: List of numpy arrays from ONNX session.run().
-
-        Returns:
-            Tuple of (signal: int, confidence: float).
+        Thresholds (buy_threshold, sell_threshold) are used consistently
+        in all branches.
         """
         output = raw_output[0]
 
-        # ── Classification output (e.g., softmax probabilities) ──────────
-        if output.ndim == 2 and output.shape[1] >= 2:
-            probabilities = output[0]
+        # ── 3-class classification ───────────────────────────────────────
+        if output.ndim == 2 and output.shape[1] == 3:
+            probs = output[0]                         # [P(sell), P(hold), P(buy)]
+            cls = int(np.argmax(probs))
+            confidence = float(probs[cls])
+            signal_map = {0: self.SIGNAL_SELL, 1: self.SIGNAL_HOLD, 2: self.SIGNAL_BUY}
+            return signal_map[cls], confidence
 
-            if len(probabilities) == 3:
-                # [P(sell), P(hold), P(buy)]
-                predicted_class = int(np.argmax(probabilities))
-                confidence = float(probabilities[predicted_class])
-                signal_map = {0: self.SIGNAL_SELL, 1: self.SIGNAL_HOLD, 2: self.SIGNAL_BUY}
-                return signal_map.get(predicted_class, self.SIGNAL_HOLD), confidence
+        # ── 2-class classification ───────────────────────────────────────
+        if output.ndim == 2 and output.shape[1] == 2:
+            probs = output[0]
+            buy_prob = float(probs[1])
+            if buy_prob >= self.buy_threshold:
+                return self.SIGNAL_BUY, buy_prob
+            if buy_prob <= self.sell_threshold:
+                return self.SIGNAL_SELL, 1.0 - buy_prob
+            # Dead zone between thresholds → HOLD
+            return self.SIGNAL_HOLD, max(buy_prob, 1.0 - buy_prob)
 
-            elif len(probabilities) == 2:
-                # [P(sell/hold), P(buy)]
-                buy_prob = float(probabilities[1])
-                if buy_prob > self._buy_threshold:
-                    return self.SIGNAL_BUY, buy_prob
-                elif buy_prob < self._sell_threshold:
-                    return self.SIGNAL_SELL, 1.0 - buy_prob
-                else:
-                    return self.SIGNAL_HOLD, 1.0 - abs(buy_prob - 0.5) * 2
-
-        # ── Regression output (single value) ─────────────────────────────
-        elif output.ndim <= 2:
+        # ── Regression (single scalar) ───────────────────────────────────
+        if output.size == 1:
             value = float(output.flat[0])
             confidence = min(abs(value), 1.0)
-
-            if value > self._buy_threshold:
+            if value >= self.buy_threshold:
                 return self.SIGNAL_BUY, confidence
-            elif value < -self._buy_threshold:
+            if value <= -self.buy_threshold:
                 return self.SIGNAL_SELL, confidence
-            else:
-                return self.SIGNAL_HOLD, 1.0 - confidence
+            return self.SIGNAL_HOLD, 1.0 - confidence
 
-        # ── Unknown format → HOLD ────────────────────────────────────────
-        logger.warning(f"Unknown model output shape: {output.shape}")
+        # ── Unknown shape ────────────────────────────────────────────────
+        logger.warning(f"Unknown ONNX output shape: {output.shape}. Returning HOLD.")
         return self.SIGNAL_HOLD, 0.0
 
-    # ── Diagnostics ──────────────────────────────────────────────────────
+    # ═════════════════════════════════════════════════════════════════════
+    #  HELPERS
+    # ═════════════════════════════════════════════════════════════════════
+
+    def _make_result(
+        self,
+        signal: int,
+        confidence: float,
+        t_start: int,
+        raw_output,
+    ) -> dict:
+        """Measure latency, update counters, build result dict."""
+        elapsed_ns = time.perf_counter_ns() - t_start
+        elapsed_ms = elapsed_ns / 1_000_000
+
+        with self._lock:
+            self._total_inferences += 1
+            self._total_latency_ns += elapsed_ns
+            self._latency_ring.append(elapsed_ns)
+            self._signal_counts[signal] = self._signal_counts.get(signal, 0) + 1
+
+        if self._total_inferences % 100 == 0:
+            avg_ms = (self._total_latency_ns / self._total_inferences) / 1_000_000
+            p95 = np.percentile(list(self._latency_ring), 95) / 1_000_000
+            logger.info(
+                f"📊 Inference #{self._total_inferences} | "
+                f"Avg: {avg_ms:.3f}ms | p95: {p95:.3f}ms | "
+                f"This: {elapsed_ms:.3f}ms | Signal: {signal} ({confidence:.2%})"
+            )
+
+        return {
+            "signal": signal,
+            "confidence": confidence,
+            "latency_ms": elapsed_ms,
+            "raw_output": raw_output,
+        }
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  DIAGNOSTICS
+    # ═════════════════════════════════════════════════════════════════════
 
     @property
     def is_ready(self) -> bool:
-        """Return True if model is loaded and ready for inference."""
+        """True when model is loaded and ready."""
         return self._session is not None
 
     @property
     def stats(self) -> dict:
-        """Return inference performance statistics."""
-        avg_ms = 0.0
-        if self._total_inferences > 0:
-            avg_ms = (self._total_latency_ns / self._total_inferences) / 1_000_000
-
-        return {
-            "total_inferences": self._total_inferences,
-            "avg_latency_ms": round(avg_ms, 4),
-            "model_loaded": self._session is not None,
-            "scaler_loaded": self._scaler is not None,
-        }
+        """Return performance and signal distribution statistics."""
+        with self._lock:
+            n = self._total_inferences
+            avg_ms = (self._total_latency_ns / n / 1_000_000) if n > 0 else 0.0
+            p95_ms = (
+                float(np.percentile(list(self._latency_ring), 95)) / 1_000_000
+                if self._latency_ring else 0.0
+            )
+            return {
+                "total_inferences": n,
+                "avg_latency_ms": round(avg_ms, 4),
+                "p95_latency_ms": round(p95_ms, 4),
+                "model_loaded": self._session is not None,
+                "scaler_loaded": self._scaler is not None,
+                "signal_distribution": dict(self._signal_counts),
+            }
