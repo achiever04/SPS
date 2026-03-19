@@ -89,20 +89,34 @@ def small():
 
 class TestBasics:
 
-    def test_returns_none_on_first_tick(self, engine):
-        result = engine.update(make_tick(100.0))
-        assert result is None
-
     def test_warmup_period_with_default_engine(self, engine):
         """
-        Default periods need ~35 ticks for MACD (26+9) to warm up.
-        Verify engine still returns None at exactly 34 ticks.
+        Default periods warm-up analysis:
+          RSI:  needs rsi_period + 1 = 15 ticks
+          ATR:  needs atr_period  + 1 = 15 ticks
+          BB:   needs bollinger_period = 20 ticks
+          VWAP: needs vwap_period      = 20 ticks
+          MACD: needs macd_slow(26) + macd_signal(9) - 1 = 34 ticks total
+
+        At tick 33 it must still return None.
+        At tick 34 it must return a feature vector.
         """
-        for i in range(34):
+        result = None
+        for i in range(33):
             result = engine.update(make_tick(100.0 + i * 0.1))
-        # At 34 ticks the signal EMA has not seeded yet
+
+        # At 33 ticks, MACD signal EMA has not seeded yet → must be None
         assert result is None, (
-            "Engine must still return None before all indicators are warm"
+            f"Engine must return None at tick 33, got: {result}"
+        )
+
+        # Feed the 34th tick — first tick where all indicators are warm
+        result = engine.update(make_tick(100.0 + 33 * 0.1))
+        assert result is not None, (
+            "Engine must return a feature vector on tick 34"
+        )
+        assert result.shape == (FEATURE_DIM,), (
+            f"Expected shape ({FEATURE_DIM},), got {result.shape}"
         )
 
     def test_small_engine_produces_features_after_warmup(self, small):
