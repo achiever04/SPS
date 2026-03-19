@@ -143,7 +143,14 @@ class InferenceEngine:
             )
 
             self._input_name = self._session.get_inputs()[0].name
-            self._output_name = self._session.get_outputs()[0].name
+            all_outputs = [o.name for o in self._session.get_outputs()]
+            # Prefer probabilities output over label output
+            self._output_name = next(
+                (o for o in all_outputs if "prob" in o.lower()),
+                all_outputs[-1]
+            )
+            logger.info(f"   Model outputs available: {all_outputs}")
+            logger.info(f"   Using output: '{self._output_name}'")
             # Cache expected input feature count for runtime validation
             self._expected_features = self._session.get_inputs()[0].shape[1]
 
